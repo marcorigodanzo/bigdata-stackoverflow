@@ -85,7 +85,7 @@ class StackOverflow extends Serializable {
       .filter(posting => posting.postingType == 1)
       .map(posting => (posting.id, posting))
       // partizionare
-      .partitionBy(new HashPartitioner(8))
+      //.partitionBy(new HashPartitioner(8))
 
     val answers = postings
       .filter(posting => posting.postingType == 2 && posting.parentId.isDefined)
