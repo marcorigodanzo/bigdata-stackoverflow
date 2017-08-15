@@ -1,8 +1,9 @@
 package stackoverflow
 
-import org.apache.spark.{HashPartitioner, SparkConf, SparkContext}
+import org.apache.spark.{HashPartitioner, RangePartitioner, SparkConf, SparkContext}
 import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
 
 import annotation.tailrec
 import scala.reflect.ClassTag
@@ -24,9 +25,11 @@ object StackOverflow extends StackOverflow {
     val lines   = sc.textFile("src/main/resources/stackoverflow/stackoverflow.csv").cache()
     val raw     = rawPostings(lines)
     val grouped = groupedPostings(raw)
-    val scored  = scoredPostings(grouped)
 
-    val vectors = vectorPostings(scored).cache()
+    val scored  = scoredPostings(grouped)
+    //val scored  = scoredPostings(grouped).sample(true, 0.1, 0)
+
+    val vectors = vectorPostings(scored).cache() //.persist(StorageLevel.MEMORY_AND_DISK)
     //assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
 
 
@@ -85,13 +88,24 @@ class StackOverflow extends Serializable {
       .filter(posting => posting.postingType == 1)
       .map(posting => (posting.id, posting))
       // partizionare
-      //.partitionBy(new HashPartitioner(8))
+      //.partitionBy(new HashPartitioner(8)).persist()
+
+    //val tuning = new RangePartitioner(8, questions)
+    val tuning = new HashPartitioner(8)
+
 
     val answers = postings
       .filter(posting => posting.postingType == 2 && posting.parentId.isDefined)
       .map(posting => (posting.parentId.getOrElse(0), posting))
 
-    questions.join(answers).groupByKey()
+    val tunedQuestions = questions.partitionBy(tuning).persist()
+    val tunedAnswers = answers.partitionBy(tuning).persist()
+
+    //questions.join(answers).groupByKey()
+    tunedQuestions.join(tunedAnswers)
+      .partitionBy(tuning)
+      .persist()
+      .groupByKey()
 
   }
 
@@ -137,7 +151,8 @@ class StackOverflow extends Serializable {
       }
     }
 
-    scored.map(pair => (firstLangInTag(pair._1.tags,langs).getOrElse(0)*langSpread,pair._2))
+    scored.cache()
+        .map(pair => (firstLangInTag(pair._1.tags,langs).getOrElse(-1)*langSpread,pair._2)).filter(pair => pair._1 >= 0)
 
   }
 
@@ -195,20 +210,23 @@ class StackOverflow extends Serializable {
   @tailrec final def kmeans(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], iter: Int = 1, debug: Boolean = false): Array[(Int, Int)] = {
     val newMeans = means.clone() // you need to compute newMeans
 
+    //val cachedVectors = vectors.cache()
+
     // for each point a new RDD[Int,(Int,Int)] is returned
     // the first element is the index of the means array
     // the second element is the point
-    val clusters = vectors.map(point => ( findClosest(point,means), point  ))
+    vectors.map(point => ( findClosest(point,means), point  ))
 
-    // the points of the clusters are then grouped
-    // RDD [index, iterable(points)]
-    val closest = clusters.groupByKey()
+      // the points of the clusters are then grouped
+      // RDD [index, iterable(points)]
+      .groupByKey()
 
-    // for each cluster a new mean is calculated
-    closest.map(t =>  (t._1, averageVectors(t._2)) ).collect()
+      // for each cluster a new mean is calculated
+      .mapValues(averageVectors(_) )
       // then the original array is updated
       // this is required because the original mean has duplicates,
       // therefore we risk shrinking the means array for each iteration
+      .collect()
       .foreach( x => newMeans(x._1) = x._2)
 
     val distance = euclideanDistance(means, newMeans)
@@ -317,18 +335,20 @@ class StackOverflow extends Serializable {
       val maxLabel = langLabels.maxBy(pair => pair._2)
       val langIndex = maxLabel._1 / langSpread
 
-      val count = vs.size
+
       val maxSize = maxLabel._2
+
+      val count = vs.size
 
       val langLabel: String   = langs(langIndex) // most common language in the cluster
       val langPercent: Double = maxSize * 100.0d / count // percent of the questions in the most common language
       val clusterSize: Int    = count
 
-      val sizes = vs.map(x => x._2).toList.sorted
-      val middle = (sizes.size /2).toInt
+      val sortedScores = vs.map(x => x._2).toList.sorted
+      val middle = clusterSize /2
 
 
-      val medianScore: Int    = sizes(middle)
+      val medianScore: Int    = if(clusterSize % 2 == 0) (sortedScores(middle-1) + sortedScores(middle)) / 2 else sortedScores(middle)
 
       (langLabel, langPercent, clusterSize, medianScore)
     }
